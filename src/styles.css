@@ -188,6 +188,12 @@ input {
 .details div { display: flex; justify-content: space-between; gap: 12px; font-size: 0.92rem; }
 .details dt { color: var(--muted); }
 .details dd { margin: 0; text-align: right; font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 0.82rem; }
+.quiet {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
 .alert, .banner {
   margin: 12px 0 0;
   padding: 10px 12px;

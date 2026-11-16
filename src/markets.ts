@@ -1,6 +1,5 @@
 import {
   AmmoraDataApiClient,
-  AmmoraDataApiError,
   ammoraLaunchFactoryV4Abi,
   ammoraLaunchPoolV4Abi,
   ammoraV3ExecutionRegistryAbi,
@@ -14,8 +13,8 @@ import {
   zeroAddress,
   type Address,
 } from "viem";
-import { DATA_API_URL, deployment, publicClient } from "./chain";
-import { explainError } from "./errors";
+import { DATA_API_URL, deployment, scanClient } from "./chain";
+import seedMarketsJson from "./seed-markets.json";
 
 export type SwapModel = "dbc" | "concentrated" | "compounding";
 
@@ -39,13 +38,58 @@ export type Market = {
   createdBlock: string | null;
 };
 
-export type MarketSource = "data-api" | "factory-logs";
+export type MarketSource = "data-api" | "factory-logs" | "saved";
 
 export type Discovery = {
   markets: Market[];
   source: MarketSource;
   notice: string | null;
+  error: string | null;
 };
+
+const CACHE_KEY = "giwa-swap.markets.v1";
+const RECENT_CHUNK = 8_000n;
+const RECENT_CHUNKS = 8;
+const DATA_API_TIMEOUT_MS = 1_200;
+
+export const seededMarkets: Market[] = (seedMarketsJson as Market[]).filter(isMarket);
+
+export function preferredMarket(markets: readonly Market[]): Market | null {
+  return markets.find((market) => market.status === 1) ?? markets[0] ?? null;
+}
+
+export function mergeMarkets(base: readonly Market[], extra: readonly Market[]): Market[] {
+  const map = new Map<string, Market>();
+  for (const market of base) map.set(market.token.toLowerCase(), market);
+  for (const market of extra) map.set(market.token.toLowerCase(), market);
+  return [...map.values()].sort(compareMarkets);
+}
+
+export function loadCachedMarkets(): Market[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as { markets?: unknown };
+    if (!Array.isArray(parsed.markets)) return [];
+    return parsed.markets.filter(isMarket);
+  } catch {
+    return [];
+  }
+}
+
+export function saveCachedMarkets(markets: readonly Market[]): void {
+  if (typeof localStorage === "undefined" || markets.length === 0) return;
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ markets }));
+  } catch {
+    // Ignore quota and private-mode failures. The bundled list still renders.
+  }
+}
+
+export function initialMarkets(): Market[] {
+  return mergeMarkets(seededMarkets, loadCachedMarkets());
+}
 
 const launchCreatedEvent = getAbiItem({
   abi: ammoraLaunchFactoryV4Abi,
@@ -55,32 +99,60 @@ const launchCreatedEvent = getAbiItem({
 const factory = deployment.contracts.launch.factory;
 const executionRegistry = deployment.contracts.routers.executionRegistry;
 
-export async function discoverMarkets(
-  onStatus?: (message: string) => void,
+export async function refreshMarkets(
+  base: readonly Market[],
+  handlers: {
+    signal: AbortSignal;
+    onStatus?: (message: string) => void;
+    onMarkets: (markets: Market[]) => void;
+  },
 ): Promise<Discovery> {
-  onStatus?.("Loading Ammora launches…");
-  const logsPromise = marketsFromFactoryLogs(onStatus);
+  let current = [...base];
+  let sawFactory = false;
+  const publish = (extra: readonly Market[]) => {
+    if (handlers.signal.aborted || extra.length === 0) return;
+    current = mergeMarkets(current, extra);
+    handlers.onMarkets(current);
+  };
+
+  const scan = scanRecentWindow(current, handlers.signal, handlers.onStatus, (found) => {
+    sawFactory = true;
+    publish(found);
+  });
+  let apiMarkets: Market[] | null = null;
+  let apiFailed = false;
   try {
-    const markets = await marketsFromDataApi();
-    return { markets, source: "data-api", notice: null };
-  } catch (error) {
-    onStatus?.("Data API unavailable. Reading V4 factory logs…");
-    const markets = await logsPromise;
-    const detail = explainError(error);
+    apiMarkets = await marketsFromDataApi(AbortSignal.any([handlers.signal, AbortSignal.timeout(DATA_API_TIMEOUT_MS)]));
+    publish(apiMarkets);
+  } catch {
+    apiFailed = true;
+  }
+  await scan;
+
+  if (current.length === 0) {
     return {
-      markets,
-      source: "factory-logs",
-      notice: `The Ammora data API did not respond (${detail}). This list was read from LaunchCreated logs on the auto-route V4 factory. Prices appear when the indexer is available.`,
+      markets: [],
+      source: "saved",
+      notice: null,
+      error: "Launches could not be loaded in time. Try again.",
     };
   }
+  if (!apiFailed && apiMarkets && apiMarkets.length > 0) {
+    return { markets: current, source: "data-api", notice: null, error: null };
+  }
+  return {
+    markets: current,
+    source: sawFactory ? "factory-logs" : "saved",
+    notice: "Indexer is unavailable. Showing saved launches.",
+    error: null,
+  };
 }
 
-async function marketsFromDataApi(): Promise<Market[]> {
+async function marketsFromDataApi(signal: AbortSignal): Promise<Market[]> {
   const data = new AmmoraDataApiClient(DATA_API_URL);
-  const signal = AbortSignal.timeout(2_500);
   const summaries = [];
   let cursor: string | undefined;
-  for (let page = 0; page < 6; page += 1) {
+  for (let page = 0; page < 2; page += 1) {
     const result = await data.getLaunches({
       chainId: 91342n,
       cursor,
@@ -119,30 +191,36 @@ async function marketsFromDataApi(): Promise<Market[]> {
   return hydrateMarkets(seeds);
 }
 
-async function marketsFromFactoryLogs(
-  onStatus?: (message: string) => void,
-): Promise<Market[]> {
-  const head = await publicClient.getBlockNumber();
-  const span = 9_000n;
-  const floor = deployment.startBlock;
+async function scanRecentWindow(
+  known: readonly Market[],
+  signal: AbortSignal,
+  onStatus: ((message: string) => void) | undefined,
+  onFound: (markets: Market[]) => void,
+): Promise<void> {
+  const head = await scanClient.getBlockNumber();
+  if (signal.aborted) return;
+  const knownNewest = known.reduce((max, market) => {
+    const block = BigInt(market.createdBlock ?? "0");
+    return block > max ? block : max;
+  }, 0n);
+  const windowFloor = head - RECENT_CHUNK * BigInt(RECENT_CHUNKS) + 1n;
+  const floor = knownNewest + 1n > windowFloor ? knownNewest + 1n : windowFloor;
+  if (floor > head) return;
+  const seen = new Set(known.map((market) => market.token.toLowerCase()));
   let cursor = head;
-  const found: Array<{
-    token: Address;
-    curve: Address;
-    creator: Address;
-    createdBlock: string;
-  }> = [];
   let failures = 0;
+  let found = 0;
 
-  for (let step = 0; step < 56 && cursor > floor && found.length < 12; step += 1) {
+  while (cursor > floor && !signal.aborted) {
     const ranges: Array<{ from: bigint; to: bigint }> = [];
-    for (let index = 0; index < 3 && cursor > floor; index += 1) {
+    for (let index = 0; index < 2 && cursor > floor; index += 1) {
       const to = cursor;
-      const from = to - span + 1n < floor ? floor : to - span + 1n;
+      const from = to - RECENT_CHUNK + 1n < floor ? floor : to - RECENT_CHUNK + 1n;
       cursor = from - 1n;
       ranges.push({ from, to });
     }
     const batches = await Promise.all(ranges.map((range) => readLaunchLogs(range.from, range.to)));
+    const seeds: Seed[] = [];
     for (const logs of batches) {
       if (logs === null) {
         failures += 1;
@@ -150,38 +228,35 @@ async function marketsFromFactoryLogs(
       }
       for (const log of logs) {
         if (!log.args.token || !log.args.curve || !log.args.creator) continue;
-        found.push({
-          token: getAddress(log.args.token),
+        const token = getAddress(log.args.token);
+        if (seen.has(token.toLowerCase())) continue;
+        seen.add(token.toLowerCase());
+        seeds.push({
+          token,
           curve: getAddress(log.args.curve),
           creator: getAddress(log.args.creator),
           createdBlock: log.blockNumber.toString(),
+          imageUrl: null,
+          feedName: null,
+          feedSymbol: null,
+          priceUsd: null,
         });
       }
     }
-    if (failures > 8) {
-      throw new Error("GIWA Sepolia RPC is rate limiting log requests. Wait a moment and refresh.");
+    if (failures > 3) return;
+    if (seeds.length > 0 && !signal.aborted) {
+      const hydrated = await hydrateMarkets(seeds);
+      found += hydrated.length;
+      if (hydrated.length > 0) onFound(hydrated);
     }
-    onStatus?.(`Reading factory logs… ${found.length} launch${found.length === 1 ? "" : "es"} so far`);
-    await sleep(40);
+    onStatus?.(`Checking recent blocks… ${found} new launch${found === 1 ? "" : "es"}`);
   }
-
-  const unique = new Map<string, (typeof found)[number]>();
-  for (const item of found) unique.set(item.token.toLowerCase(), item);
-  const seeds = [...unique.values()].map((item) => ({
-    ...item,
-    imageUrl: null,
-    feedName: null,
-    feedSymbol: null,
-    priceUsd: null,
-  }));
-  return hydrateMarkets(seeds);
 }
 
 async function readLaunchLogs(from: bigint, to: bigint) {
-  let delay = 600;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      return await publicClient.getLogs({
+      return await scanClient.getLogs({
         address: factory,
         event: launchCreatedEvent,
         fromBlock: from,
@@ -190,9 +265,8 @@ async function readLaunchLogs(from: bigint, to: bigint) {
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
       const limited = /429|rate limit|over rate|timeout/i.test(message);
-      if (!limited || attempt === 4) return null;
-      await sleep(delay);
-      delay *= 2;
+      if (!limited || attempt === 1) return null;
+      await sleep(400);
     }
   }
   return null;
@@ -236,10 +310,10 @@ async function hydrateMarkets(seeds: Seed[]): Promise<Market[]> {
     await mapLimited(seeds, 2, async (seed) => {
       try {
         const [status, quoteToken, baseToken, canonical] = await Promise.all([
-          publicClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "status" }),
-          publicClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "quoteToken" }),
-          publicClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "baseToken" }),
-          publicClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "canonicalPool" }),
+          scanClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "status" }),
+          scanClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "quoteToken" }),
+          scanClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "baseToken" }),
+          scanClient.readContract({ address: seed.curve, abi: ammoraLaunchPoolV4Abi, functionName: "canonicalPool" }),
         ]);
         const statusCode = asNumber(status);
         if (statusCode === null || getAddress(baseToken) !== seed.token) return null;
@@ -261,7 +335,7 @@ async function hydrateMarkets(seeds: Seed[]): Promise<Market[]> {
     let registryKind: number | null = null;
     if (item.status === 3 && item.canonicalPool) {
       try {
-        const kind = await publicClient.readContract({
+        const kind = await scanClient.readContract({
           address: executionRegistry,
           abi: ammoraV3ExecutionRegistryAbi,
           functionName: "poolKind",
@@ -284,9 +358,9 @@ async function hydrateMarkets(seeds: Seed[]): Promise<Market[]> {
     await mapLimited([...tokenSet.values()], 4, async (token) => {
       try {
         const [symbol, name, decimals] = await Promise.all([
-          readWithRetry(() => publicClient.readContract({ address: token, abi: erc20Abi, functionName: "symbol" })).catch(() => ""),
-          readWithRetry(() => publicClient.readContract({ address: token, abi: erc20Abi, functionName: "name" })).catch(() => "Token"),
-          readWithRetry(() => publicClient.readContract({ address: token, abi: erc20Abi, functionName: "decimals" })),
+          readWithRetry(() => scanClient.readContract({ address: token, abi: erc20Abi, functionName: "symbol" })).catch(() => ""),
+          readWithRetry(() => scanClient.readContract({ address: token, abi: erc20Abi, functionName: "name" })).catch(() => "Token"),
+          readWithRetry(() => scanClient.readContract({ address: token, abi: erc20Abi, functionName: "decimals" })),
         ]);
         const parsedDecimals = asNumber(decimals);
         if (parsedDecimals === null) return null;
@@ -336,12 +410,7 @@ async function hydrateMarkets(seeds: Seed[]): Promise<Market[]> {
     ];
   });
 
-  return markets.sort((left, right) => {
-    const rank = (status: number) => (status === 1 ? 0 : status === 3 ? 1 : 2);
-    const byStatus = rank(left.status) - rank(right.status);
-    if (byStatus !== 0) return byStatus;
-    return Number(right.createdBlock ?? 0) - Number(left.createdBlock ?? 0);
-  });
+  return markets.sort(compareMarkets);
 }
 
 async function mapLimited<T, R>(items: readonly T[], limit: number, map: (item: T) => Promise<R>): Promise<R[]> {
@@ -370,6 +439,25 @@ function usdFromPrice(price: AmmoraUsdPrice): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-export function isDataApiError(error: unknown): error is AmmoraDataApiError {
-  return error instanceof AmmoraDataApiError;
+function compareMarkets(left: Market, right: Market): number {
+  const rank = (status: number) => (status === 1 ? 0 : status === 3 ? 1 : 2);
+  const byStatus = rank(left.status) - rank(right.status);
+  if (byStatus !== 0) return byStatus;
+  return Number(right.createdBlock ?? 0) - Number(left.createdBlock ?? 0);
+}
+
+function isMarket(value: unknown): value is Market {
+  if (!value || typeof value !== "object") return false;
+  const market = value as Market;
+  return (
+    typeof market.token === "string" &&
+    typeof market.curve === "string" &&
+    typeof market.quoteToken === "string" &&
+    typeof market.tradablePool === "string" &&
+    typeof market.symbol === "string" &&
+    typeof market.decimals === "number" &&
+    typeof market.quoteDecimals === "number" &&
+    (market.model === "dbc" || market.model === "concentrated" || market.model === "compounding") &&
+    typeof market.status === "number"
+  );
 }

@@ -34,17 +34,17 @@ export function MarketList({
             {source === "data-api"
               ? "Live tokens from the Ammora data API."
               : source === "factory-logs"
-                ? "Tokens discovered from the V4 factory while the indexer is down."
+                ? "Saved launches, plus any new ones in the recent block window."
                 : "Ammora launches on GIWA Sepolia."}
           </p>
         </div>
-        <button type="button" className="text-button" onClick={onRetry} disabled={loading}>
-          {loading ? "Loading" : "Refresh"}
+        <button type="button" className="text-button" onClick={onRetry} disabled={loading && markets.length === 0}>
+          {loading && markets.length === 0 ? "Loading" : "Refresh"}
         </button>
       </div>
 
-      {notice ? <p className="banner">{notice}</p> : null}
-      {error ? (
+      {notice ? <p className="quiet">{notice}</p> : null}
+      {error && markets.length === 0 ? (
         <div className="empty">
           <h3>Launches could not be loaded</h3>
           <p>{error}</p>
@@ -70,7 +70,7 @@ export function MarketList({
         </div>
       ) : null}
 
-      {status && loading ? <p className="status-line">{status}</p> : null}
+      {status ? <p className="status-line">{status}</p> : null}
 
       <ul className="market-list">
         {markets.map((market) => {

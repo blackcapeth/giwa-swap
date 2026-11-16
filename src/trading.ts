@@ -15,7 +15,7 @@ import {
   type Hash,
   type WalletClient,
 } from "viem";
-import { publicClient } from "./chain";
+import { quoteClient } from "./chain";
 import type { Market } from "./markets";
 
 export type QuoteView = {
@@ -31,8 +31,11 @@ export type QuoteView = {
   expiresAtMs: number;
   pool: Address;
   model: AmmoraSwapModel;
+  slippageBps: number;
   approvals: readonly ERC20ApprovalRequirement[];
 };
+
+const QUOTE_TIMEOUT_MS = 12_000;
 
 const SWAP_MODELS = new Set<AmmoraSwapModel>(["almm", "concentrated", "compounding", "dbc"]);
 
@@ -40,11 +43,15 @@ let swapClientPromise: Promise<AmmoraSwapClient> | null = null;
 const routeCache = new Map<string, { at: number; client: Promise<AmmoraRouteClient> }>();
 
 function getSwapClient(): Promise<AmmoraSwapClient> {
-  swapClientPromise ??= AmmoraSwapClient.create(publicClient, {
+  swapClientPromise ??= AmmoraSwapClient.create(quoteClient, {
     deploymentCatalog: giwaSepoliaAutoRouteDeploymentCatalog,
     factoryProfiles: giwaSepoliaAutoRoutePoolProfiles,
   });
   return swapClientPromise;
+}
+
+export function warmRoute(market: Market): void {
+  void getRouteClient(market).catch(() => undefined);
 }
 
 function getRouteClient(market: Market): Promise<AmmoraRouteClient> {
@@ -53,11 +60,11 @@ function getRouteClient(market: Market): Promise<AmmoraRouteClient> {
   if (cached && Date.now() - cached.at < 40_000) return cached.client;
   const client = (async () => {
     const verificationBlock = await resolveAmmoraFinalizedHead(
-      [publicClient],
+      [quoteClient],
       giwaSepoliaAutoRoute.finality,
     );
     return AmmoraRouteClient.create({
-      client: publicClient,
+      client: quoteClient,
       routeCatalog: giwaSepoliaAutoRouteCatalog,
       deploymentCatalog: giwaSepoliaAutoRouteDeploymentCatalog,
       factoryProfiles: giwaSepoliaAutoRoutePoolProfiles,
@@ -104,15 +111,45 @@ export async function quoteMarket(input: {
   amountIn: bigint;
   slippageBps: number;
 }): Promise<QuoteView> {
+  return withTimeout(quoteMarketAttempts(input), QUOTE_TIMEOUT_MS);
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Quote timed out")), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function quoteMarketAttempts(input: {
+  market: Market;
+  tokenIn: Address;
+  tokenOut: Address;
+  amountIn: bigint;
+  slippageBps: number;
+}): Promise<QuoteView> {
   let last: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      return await quoteMarketOnce(input);
+      const quote = await quoteMarketOnce(input);
+      if (quote.amountIn !== input.amountIn) {
+        throw new Error("Quote amount did not match the request.");
+      }
+      return quote;
     } catch (error) {
       last = error;
       const message = error instanceof Error ? error.message : "";
       if (!/429|rate limit|over rate/i.test(message) || attempt === 2) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 2_000 * (attempt + 1)));
+      await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
     }
   }
   throw last;
@@ -157,6 +194,7 @@ async function quoteMarketOnce(input: {
       expiresAtMs: quote.expiresAtMs,
       pool: hop.pool,
       model: hop.model,
+      slippageBps: input.slippageBps,
       approvals: quote.approvals,
     };
   } catch (routeError) {
@@ -188,6 +226,7 @@ async function quoteMarketOnce(input: {
         expiresAtMs: prepared.quote.expiresAtMs,
         pool: prepared.quote.pool,
         model: prepared.quote.model,
+        slippageBps: input.slippageBps,
         approvals: prepared.approvalRequirements,
       };
     } catch (swapError) {
@@ -210,7 +249,7 @@ export async function approvalStillNeeded(
   if (approvals.length === 0) return false;
   const allowances = await Promise.all(
     approvals.map((approval) =>
-      publicClient.readContract({
+      quoteClient.readContract({
         address: approval.token,
         abi: erc20Abi,
         functionName: "allowance",

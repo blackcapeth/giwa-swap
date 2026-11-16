@@ -24,6 +24,7 @@ export function explainError(error: unknown): string {
     if (/429|rate limit|over rate/i.test(error.message)) {
       return "GIWA Sepolia RPC is rate limiting requests. Wait a moment and refresh.";
     }
+    if (/quote timed out/i.test(error.message)) return "The quote timed out. Try the amount again.";
     if (/timed out|aborted/i.test(error.message)) return "timed out";
     if (/failed to fetch|networkerror|load failed/i.test(error.message)) {
       return "The network request failed. Check the connection and try again.";

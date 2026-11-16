@@ -1,5 +1,18 @@
 import { parseUnits } from "viem";
 
+export type AmountDraft = "empty" | "partial" | "invalid" | "ready";
+
+/** Distinguish a half-typed amount from one that can be quoted. */
+export function amountDraft(value: string, decimals: number): AmountDraft {
+  const trimmed = value.trim();
+  if (!trimmed) return "empty";
+  if (!/^\d*\.?\d*$/.test(trimmed)) return "invalid";
+  if (trimmed.endsWith(".")) return "partial";
+  if (parseAmount(trimmed, decimals)) return "ready";
+  if (/^0*\.?0*$/.test(trimmed)) return "partial";
+  return "invalid";
+}
+
 export function parseAmount(value: string, decimals: number): bigint | null {
   const trimmed = value.trim();
   if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;

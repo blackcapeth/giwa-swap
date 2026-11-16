@@ -7,7 +7,7 @@ Live app: [https://blackcapeth.github.io/giwa-swap/](https://blackcapeth.github.
 ## What you can do
 
 - Connect an injected wallet (MetaMask and other EIP-1193 wallets) and add or switch to GIWA Sepolia.
-- Browse Ammora launches. The list comes from `AmmoraDataApiClient` against `https://ammora-giwa-sepolia-data.fly.dev`. If that indexer is unavailable, the app reads `LaunchCreated` logs from the auto-route V4 factory in the SDK catalog.
+- Browse Ammora launches. A saved list is shown immediately, then the app checks a recent factory-log window and the Ammora data API (`https://ammora-giwa-sepolia-data.fly.dev`) with a short timeout. Results are cached in the browser.
 - Click a launch to prefill the swap. USD prices are shown when the data API returns them.
 - Get a live exact-input quote from `AmmoraRouteClient`, including the SDK minimum out for the selected slippage. If the route client cannot price a graduated pool, the app asks `AmmoraSwapClient` for the same quote so the contract error is visible.
 - Approve the pool when the allowance is short, then send the swap. `AmmoraSwapClient.prepareExactIn` builds the transaction and `PreparedExactInputSwap.execute` asks the connected wallet to sign.

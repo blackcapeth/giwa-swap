@@ -6,9 +6,16 @@ import { Header } from "./components/Header";
 import { MarketList } from "./components/MarketList";
 import { SwapCard, type TokenChoice } from "./components/SwapCard";
 import { explainError } from "./errors";
-import { formatAmount, formatBps, parseAmount, shortAddress } from "./format";
-import { discoverMarkets, type Market, type MarketSource } from "./markets";
-import { approvalStillNeeded, executeQuotedSwap, findMarket, quoteMarket, type QuoteView } from "./trading";
+import { amountDraft, formatAmount, formatBps, parseAmount, shortAddress } from "./format";
+import {
+  initialMarkets,
+  preferredMarket,
+  refreshMarkets,
+  saveCachedMarkets,
+  type Market,
+  type MarketSource,
+} from "./markets";
+import { approvalStillNeeded, executeQuotedSwap, findMarket, quoteMarket, warmRoute, type QuoteView } from "./trading";
 import {
   connectWallet,
   formatEth,
@@ -20,16 +27,19 @@ import {
   walletClientFor,
 } from "./wallet";
 
+const REFRESH_BUDGET_MS = 8_000;
+
 export function App() {
-  const [markets, setMarkets] = useState<Market[]>([]);
-  const [source, setSource] = useState<MarketSource | null>(null);
+  const [markets, setMarkets] = useState<Market[]>(() => initialMarkets());
+  const [source, setSource] = useState<MarketSource | null>("saved");
   const [notice, setNotice] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [listStatus, setListStatus] = useState<string | null>(null);
-  const [listLoading, setListLoading] = useState(true);
+  const [listLoading, setListLoading] = useState(() => initialMarkets().length === 0);
+  const [reloadKey, setReloadKey] = useState(0);
 
-  const [tokenIn, setTokenIn] = useState<Address | null>(null);
-  const [tokenOut, setTokenOut] = useState<Address | null>(null);
+  const [tokenIn, setTokenIn] = useState<Address | null>(() => preferredMarket(initialMarkets())?.quoteToken ?? null);
+  const [tokenOut, setTokenOut] = useState<Address | null>(() => preferredMarket(initialMarkets())?.token ?? null);
   const [amount, setAmount] = useState("0.001");
   const [slippageBps, setSlippageBps] = useState(50);
 
@@ -50,45 +60,72 @@ export function App() {
   const [receipt, setReceipt] = useState<{ hash: string; approvalHashes: readonly string[] } | null>(null);
 
   const requestId = useRef(0);
-  const initialized = useRef(false);
 
-  const loadMarkets = useCallback(async () => {
-    setListLoading(true);
+  useEffect(() => {
+    const controller = new AbortController();
+    const budget = window.setTimeout(() => controller.abort(), REFRESH_BUDGET_MS);
+    let alive = true;
     setListError(null);
-    setListStatus("Checking the Ammora data API…");
-    try {
-      const result = await discoverMarkets(setListStatus);
-      setMarkets(result.markets);
-      setSource(result.source);
-      setNotice(result.notice);
-      setListStatus(null);
-    } catch (error) {
-      setMarkets([]);
-      setSource(null);
-      setNotice(null);
-      setListError(explainError(error));
-      setListStatus(null);
-    } finally {
-      setListLoading(false);
-    }
-  }, []);
+    setListStatus("Checking for new launches…");
+    if (markets.length === 0) setListLoading(true);
+    void refreshMarkets(markets, {
+      signal: controller.signal,
+      onStatus: (message) => {
+        if (alive) setListStatus(message);
+      },
+      onMarkets: (next) => {
+        if (!alive) return;
+        setMarkets(next);
+        saveCachedMarkets(next);
+        setListLoading(false);
+      },
+    })
+      .then((result) => {
+        if (!alive) return;
+        setMarkets(result.markets);
+        saveCachedMarkets(result.markets);
+        setSource(result.source);
+        setNotice(result.notice);
+        setListError(result.error);
+      })
+      .catch((error: unknown) => {
+        if (!alive || controller.signal.aborted) return;
+        setListError(explainError(error));
+      })
+      .finally(() => {
+        if (!alive) return;
+        window.clearTimeout(budget);
+        setListLoading(false);
+        setListStatus(null);
+      });
+    return () => {
+      alive = false;
+      controller.abort();
+      window.clearTimeout(budget);
+    };
+    // Reload is explicit. The in-flight refresh owns the list it started from.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadKey]);
 
   useEffect(() => {
-    void loadMarkets();
-  }, [loadMarkets]);
-
-  useEffect(() => {
-    if (initialized.current || markets.length === 0) return;
-    const market = markets.find((item) => item.status === 1) ?? markets[0];
+    if (tokenIn && tokenOut) return;
+    const market = preferredMarket(markets);
     if (!market) return;
-    initialized.current = true;
     setTokenIn(market.quoteToken);
     setTokenOut(market.token);
-  }, [markets]);
+  }, [markets, tokenIn, tokenOut]);
 
   const tokens = useMemo(() => tokenChoices(markets), [markets]);
   const payToken = tokens.find((token) => token.address === tokenIn) ?? null;
   const receiveToken = tokens.find((token) => token.address === tokenOut) ?? null;
+  const market = useMemo(
+    () => (tokenIn && tokenOut ? findMarket(markets, tokenIn, tokenOut) : null),
+    [markets, tokenIn, tokenOut],
+  );
+
+  useEffect(() => {
+    if (market) warmRoute(market);
+  }, [market]);
 
   const refreshBalances = useCallback(async () => {
     if (!account) {
@@ -140,9 +177,9 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!tokenIn || !tokenOut || markets.length === 0) {
+    if (!tokenIn || !tokenOut || !market) {
       setQuote(null);
-      setQuoteError(null);
+      setQuoteError(tokenIn && tokenOut && markets.length > 0 ? "These tokens do not share a launch market." : null);
       setQuoteLoading(false);
       return;
     }
@@ -152,28 +189,43 @@ export function App() {
       setQuoteLoading(false);
       return;
     }
-    const pay = tokens.find((token) => token.address === tokenIn);
-    if (!pay) return;
-    const parsed = parseAmount(amount, pay.decimals);
-    if (!parsed) {
+    const payDecimals =
+      tokenIn.toLowerCase() === market.quoteToken.toLowerCase() ? market.quoteDecimals : market.decimals;
+    const draft = amountDraft(amount, payDecimals);
+    if (draft === "empty") {
       setQuote(null);
-      setQuoteError(amount.trim() ? "Enter an amount that fits this token's decimals." : null);
+      setQuoteError(null);
       setQuoteLoading(false);
       return;
     }
-    const market = findMarket(markets, tokenIn, tokenOut);
-    if (!market) {
+    if (draft === "invalid") {
       setQuote(null);
-      setQuoteError("These tokens do not share a launch market.");
+      setQuoteError("Enter an amount that fits this token's decimals.");
       setQuoteLoading(false);
       return;
     }
+    if (draft === "partial") {
+      setQuoteError(null);
+      setQuoteLoading(true);
+      return;
+    }
+    const parsed = parseAmount(amount, payDecimals);
+    if (!parsed) return;
 
-    let timer = 0;
+    let debounce = 0;
+    let kill = 0;
     let interval = 0;
     const run = () => {
+      window.clearTimeout(kill);
       const id = ++requestId.current;
       setQuoteLoading(true);
+      setQuoteError(null);
+      kill = window.setTimeout(() => {
+        if (id !== requestId.current) return;
+        setQuote(null);
+        setQuoteError("The quote timed out. Try the amount again.");
+        setQuoteLoading(false);
+      }, 12_000);
       void quoteMarket({
         market,
         tokenIn,
@@ -183,26 +235,29 @@ export function App() {
       })
         .then((next) => {
           if (id !== requestId.current) return;
+          if (next.amountIn !== parsed || next.slippageBps !== slippageBps) return;
+          window.clearTimeout(kill);
           setQuote(next);
           setQuoteError(null);
+          setQuoteLoading(false);
         })
         .catch((error: unknown) => {
           if (id !== requestId.current) return;
+          window.clearTimeout(kill);
           setQuote(null);
           setQuoteError(explainError(error));
-        })
-        .finally(() => {
-          if (id === requestId.current) setQuoteLoading(false);
+          setQuoteLoading(false);
         });
     };
-    timer = window.setTimeout(run, 280);
+    debounce = window.setTimeout(run, 280);
     interval = window.setInterval(run, 15_000);
     return () => {
-      window.clearTimeout(timer);
+      window.clearTimeout(debounce);
+      window.clearTimeout(kill);
       window.clearInterval(interval);
       requestId.current += 1;
     };
-  }, [amount, listLoading, markets, slippageBps, tokenIn, tokenOut, tokens]);
+  }, [amount, market?.decimals, market?.model, market?.quoteDecimals, market?.status, market?.tradablePool, slippageBps, tokenIn, tokenOut]);
 
   useEffect(() => {
     if (!account || !quote) {
@@ -224,6 +279,17 @@ export function App() {
 
   const wrongNetwork = account !== null && chainId !== GIWA_CHAIN_ID;
   const parsedAmount = payToken ? parseAmount(amount, payToken.decimals) : null;
+  const quoteCurrent =
+    quote &&
+    parsedAmount &&
+    tokenIn &&
+    tokenOut &&
+    quote.amountIn === parsedAmount &&
+    quote.slippageBps === slippageBps &&
+    quote.tokenIn.toLowerCase() === tokenIn.toLowerCase() &&
+    quote.tokenOut.toLowerCase() === tokenOut.toLowerCase()
+      ? quote
+      : null;
   const insufficient =
     payBalance !== null && parsedAmount !== null && payBalance < parsedAmount;
   const swapping = phase === "preparing" || phase === "approving" || phase === "swapping";
@@ -232,7 +298,7 @@ export function App() {
   if (account && wrongNetwork) buttonLabel = "Switch to GIWA Sepolia";
   else if (account && !parsedAmount) buttonLabel = "Enter an amount";
   else if (account && quoteError) buttonLabel = "No route";
-  else if (account && quoteLoading && !quote) buttonLabel = "Quoting…";
+  else if (account && quoteLoading && !quoteCurrent) buttonLabel = "Quoting…";
   else if (account && insufficient) buttonLabel = "Insufficient balance";
   else if (account && phase === "approving") buttonLabel = "Approve in wallet…";
   else if (account && phase === "swapping") buttonLabel = "Confirm swap…";
@@ -244,7 +310,7 @@ export function App() {
     swapping ||
     (account !== null &&
       !wrongNetwork &&
-      (!parsedAmount || Boolean(quoteError) || insufficient || (quoteLoading && !quote) || !quote));
+      (!parsedAmount || Boolean(quoteError) || insufficient || !quoteCurrent));
 
   async function onConnect() {
     setWalletBusy(true);
@@ -285,13 +351,13 @@ export function App() {
       await onSwitch();
       return;
     }
-    if (!quote || !parsedAmount) return;
+    if (!quoteCurrent || !parsedAmount) return;
     setSwapError(null);
     setReceipt(null);
     setPhase("preparing");
     try {
       const result = await executeQuotedSwap({
-        quote,
+        quote: quoteCurrent,
         account,
         wallet: walletClientFor(account),
         slippageBps,
@@ -306,18 +372,18 @@ export function App() {
     }
   }
 
-  const outputLabel = quote && receiveToken
-    ? formatAmount(quote.expectedAmountOut, receiveToken.decimals)
+  const outputLabel = quoteCurrent && receiveToken
+    ? formatAmount(quoteCurrent.expectedAmountOut, receiveToken.decimals)
     : quoteLoading
       ? "…"
       : "—";
-  const minOutLabel = quote && receiveToken
-    ? `${formatAmount(quote.minimumAmountOut, receiveToken.decimals)} ${receiveToken.symbol}`
+  const minOutLabel = quoteCurrent && receiveToken
+    ? `${formatAmount(quoteCurrent.minimumAmountOut, receiveToken.decimals)} ${receiveToken.symbol}`
     : null;
-  const feeLabel = quote
-    ? quote.feeAmount === null
+  const feeLabel = quoteCurrent
+    ? quoteCurrent.feeAmount === null
       ? "Included in the route"
-      : `${formatAmount(quote.feeAmount, feeDecimals(quote, tokens))} ${feeSymbol(quote, tokens)}`
+      : `${formatAmount(quoteCurrent.feeAmount, feeDecimals(quoteCurrent, tokens))} ${feeSymbol(quoteCurrent, tokens)}`
     : "";
 
   return (
@@ -366,23 +432,23 @@ export function App() {
           quoteLoading={quoteLoading}
           quoteError={quoteError}
           details={
-            quote
+            quoteCurrent
               ? {
-                  model: quote.model.toUpperCase(),
-                  pool: quote.pool,
-                  block: quote.quoteBlockNumber.toLocaleString("en-US"),
-                  impact: quote.priceImpactBps === null ? "—" : formatBps(Number(quote.priceImpactBps)),
+                  model: quoteCurrent.model.toUpperCase(),
+                  pool: quoteCurrent.pool,
+                  block: quoteCurrent.quoteBlockNumber.toLocaleString("en-US"),
+                  impact: quoteCurrent.priceImpactBps === null ? "—" : formatBps(Number(quoteCurrent.priceImpactBps)),
                   fee: feeLabel,
                   approval: !account
-                    ? quote.approvals.length === 0
+                    ? quoteCurrent.approvals.length === 0
                       ? "Not required"
                       : "Your wallet approves this if it is needed"
-                    : needsApproval && quote.approvals[0]
-                      ? `${payToken?.symbol ?? "Token"} → ${shortAddress(quote.approvals[0].spender)}`
-                      : quote.approvals.length === 0
+                    : needsApproval && quoteCurrent.approvals[0]
+                      ? `${payToken?.symbol ?? "Token"} → ${shortAddress(quoteCurrent.approvals[0].spender)}`
+                      : quoteCurrent.approvals.length === 0
                         ? "Not required"
                         : "Already approved",
-                  expiresAtMs: quote.expiresAtMs,
+                  expiresAtMs: quoteCurrent.expiresAtMs,
                 }
               : null
           }
@@ -392,7 +458,7 @@ export function App() {
           note={
             swapError ??
             walletNote ??
-            (quote
+            (quoteCurrent
               ? `Quote expires in 30 seconds and refreshes automatically. SDK deadline is 20 minutes. Deployment ${deployment.slot}.`
               : null)
           }
@@ -413,7 +479,7 @@ export function App() {
             setReceipt(null);
             setSwapError(null);
           }}
-          onRetry={() => void loadMarkets()}
+          onRetry={() => setReloadKey((key) => key + 1)}
         />
       </main>
       <Footer />

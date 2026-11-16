@@ -57,6 +57,18 @@ export const publicClient: PublicClient = createPublicClient({
   transport: pacedHttp(GIWA_RPC_URL),
 });
 
+/** Quotes stay off the paced wallet queue so a log scan cannot stall them. */
+export const quoteClient: PublicClient = createPublicClient({
+  chain: giwaChain,
+  transport: http(GIWA_RPC_URL, { retryCount: 1, timeout: 10_000 }),
+});
+
+/** Discovery reads use their own client and a hard per-call timeout. */
+export const scanClient: PublicClient = createPublicClient({
+  chain: giwaChain,
+  transport: http(GIWA_RPC_URL, { retryCount: 0, timeout: 8_000 }),
+});
+
 export function explorerTx(hash: string): string {
   return `${GIWA_EXPLORER_URL}/tx/${hash}`;
 }
